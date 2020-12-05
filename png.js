@@ -1,6 +1,6 @@
 import * as pako from 'https://unpkg.com/pako@latest?module';
 import assert from './assert.js';
-
+import BitReadStream from './stream.js';
 
 const CHUNK_TYPE = {
     PLTE: {
@@ -31,30 +31,35 @@ const COLOR_TYPE = {
     GRAYSCALE: {
         name: 'Grayscale',
         code: 0,
+        channels: 1,
         allowed_bit_depths: [1,2,4,8,16],
         toString: function() {return this.name}
     },
     RGB: {
         name: 'RGB',
         code: 2,
+        channels: 3,
         allowed_bit_depths: [8,16],
         toString: function() {return this.name}
     },
     PALETTE: {
         name: 'Palette',
         code: 3,
+        channels: 1,
         allowed_bit_depths: [1,2,4,8],
         toString: function() {return this.name}
     },
     ALPHA_GRAYSCALE: {
         name: 'Grayscale with alpha channel',
         code: 4,
+        channels: 2,
         allowed_bit_depths: [8,16],
         toString: function() {return this.name}
     },
     ALPHA_RGB: {
         name: 'Grayscale with alpha channel',
         code: 6,
+        channels: 4,
         allowed_bit_depths: [8,16],
         toString: function() {return this.name}
     }
@@ -89,19 +94,22 @@ export default {
         if(plteIndices.length > 1) throw 'Found multiple PLTE chunks, which is not supported'
         if(plteIndices.length > 0) {
             let plteLength = this.number(new Uint8Array(buffer, plteIndices[0], 4));
-            img.PLTE = decodePLTE(new Uint8Array(buffer, plteIndices[0], plteLength))
+            img.PLTE = this.decodePLTE(new Uint8Array(buffer, plteIndices[0], plteLength + 8))
         }
 
         //IDAT
         let dataIndices = this.getChunkIndex(buffer, CHUNK_TYPE.IDAT);
         if(dataIndices.length == 0) throw 'No IDAT chunk found'
         else {
-            img.scanlines = [];
+            img.rawData = [];
             dataIndices.forEach((x) => {
                 let length = this.number(new Uint8Array(buffer, x, 4));
-                img.scanlines.push(this.decodeIDAT(new Uint8Array(buffer, x, length)));
+                img.rawData.push(this.decodeIDAT(new Uint8Array(buffer, x, length + 8)));
             });
+            img.rawData = img.rawData.join(); 
         }
+        
+        img.referenceImage = this.decodeScanlines(img.rawData, img.IHDR);
 
         return img;
     },
@@ -137,6 +145,8 @@ export default {
         decode.depth = this.number(chunk.slice(16,17));
         let colorCode = this.number(chunk.slice(17,18));
         decode.colorType = this.decodeColorType(colorCode);
+        let validDepth = decode.colorType.allowed_bit_depths.includes(decode.depth);
+        assert(validDepth).message(`Invalid bit depth (${decode.depth})for colorType ${colorType.toString()}`).equal(true);
         decode.compression = this.number(chunk.slice(18,19));
         decode.filter = this.number(chunk.slice(19,20));
         decode.interlace = this.number(chunk.slice(20,21));
@@ -166,50 +176,75 @@ export default {
        assert(chunk[5]).message('Expected PLTE header').equal(CHUNK_TYPE.PLTE.code[1]);
        assert(chunk[6]).message('Expected PLTE header').equal(CHUNK_TYPE.PLTE.code[2]);
        assert(chunk[7]).message('Expected PLTE header').equal(CHUNK_TYPE.PLTE.code[3]);
-       const steps = Math.floor(length / 3);
        let data = chunk.slice(8,chunk.length);
-       for (let i = 0; i <= steps; i++) {
-           let rgb = [];
-           rgb.push(data[1*i]);
-           rgb.push(data[2*i]);
-           rgb.push(data[3*i]);
-           decode.push(rgb);
+       for (let i = 0; i < data.length; i+=3) {
+           decode.push(data.slice(i,i+3));
        }
        return decode;
     },
-        /** 
+    /** 
     *  @param {Uint8Array} chunk Raw chunk data 
     *  @return {Array} The decoded chunk data (palette)
     *  @description Decodes the chunk into an array 
     *               containing the palette rgb values
     */ 
    decodeIDAT(chunk) {
-    //The spec required the PLTE header to appear zero or one times
-    //First comes the length of the chunk then the chunk type & chunk data
-    // The length should be divisible by 3
-    // 1 to 256 Entries (each 3 bytes long)
-    /* Chunk length        4 bytes 
-    *  Chunk type          4 bytes  
-    *  R                   1 byte
-    *  G                   1 byte
-    *  B                   1 byte
-    */
-   const length = this.number(chunk.slice(0,4));
-   assert(chunk[4]).message('Expected IDAT header').equal(CHUNK_TYPE.IDAT.code[0]);
-   assert(chunk[5]).message('Expected IDAT header').equal(CHUNK_TYPE.IDAT.code[1]);
-   assert(chunk[6]).message('Expected IDAT header').equal(CHUNK_TYPE.IDAT.code[2]);
-   assert(chunk[7]).message('Expected IDAT header').equal(CHUNK_TYPE.IDAT.code[3]);
-   let decode;
-   try {
-    let payload = chunk.slice(8, length)
-    let test = pako.deflate(new Uint8Array([0,1,2,3,4]));
-    decode = pako.inflate(payload);
-   } catch (error) {
-       throw error
-   }
+         //The spec required the PLTE header to appear zero or one times
+         //First comes the length of the chunk then the chunk type & chunk data
+         // The length should be divisible by 3
+         // 1 to 256 Entries (each 3 bytes long)
+         /* Chunk length        4 bytes 
+         *  Chunk type          4 bytes  
+         *  R                   1 byte
+         *  G                   1 byte
+         *  B                   1 byte
+         */
+        const length = this.number(chunk.slice(0,4));
+        assert(chunk[4]).message('Expected IDAT header').equal(CHUNK_TYPE.IDAT.code[0]);
+        assert(chunk[5]).message('Expected IDAT header').equal(CHUNK_TYPE.IDAT.code[1]);
+        assert(chunk[6]).message('Expected IDAT header').equal(CHUNK_TYPE.IDAT.code[2]);
+        assert(chunk[7]).message('Expected IDAT header').equal(CHUNK_TYPE.IDAT.code[3]);
+        let decode;
+        try {
+         let payload = chunk.slice(8, length+8)
+         decode = pako.inflate(payload);
+        } catch (error) {
+            throw error
+        }
+        if(!decode) throw 'Could not inflate IDAT payload';
+        return decode;
+    },
+    /** 
+     *  @param {Array} raw Unfiltered scanlines (decompressed idat chunks)
+     *  @param {Object} IHDR the decoded IHDR chunk 
+     *  @return {Array<Array<int>>} Reference Image
+     *  @description Decodes the filtered scnaline data into an array 
+     *               of unfiltered rows of pixel data
+     */ 
+    decodeScanlines(raw, IHDR) { 
+        //Each scanline consists of 1 filter type byte followed by pixel data
+        //There is no space between pixeldata (individual scanlines)
+      
+        //First determine the length of each scanline and the number of scanlines
+        //A single pack is the union of all samples regarding a single pixel
+        let packLength = IHDR.colorType.channels * IHDR.depth;
+        let length = IHDR.width * packLength;
   
-   return decode;
-},
+
+    },
+     /** 
+     *  @param {Uint8Array} raw Unfiltered scanlines (decompressed idat chunks)
+     *  @param {Object} IHDR the decoded IHDR chunk 
+     *  @return {Array<Array<int>>} Reference Image
+     *  @description Decodes the filtered scnaline data into an array 
+     *               of unfiltered rows of pixel data
+     */ 
+    decodeScanline(line, length) { 
+        let packLength = IHDR.colorType.channels * IHDR.depth;
+        let length = IHDR.width * packLength;
+        
+
+    },
     /** 
     *  @param {int} code The bytes allocated for a number
     *  @return {COLOR_TYPE} Return the unsigned int 
